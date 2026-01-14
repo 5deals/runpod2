@@ -17,5 +17,14 @@ COPY handler.py /app/
 ENV PYTHONUNBUFFERED=1
 ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 
+# PoC v2 settings
+ENV POC_VERSION=v2
+ENV MODEL_NAME=Qwen/Qwen3-32B-FP8
+ENV K_DIM=12
+
+# HuggingFace cache location (RunPod caches models here)
+ENV HF_HOME=/runpod-volume/huggingface-cache
+ENV TRANSFORMERS_CACHE=/runpod-volume/huggingface-cache/hub
+
 # Run the handler
 CMD ["python", "handler.py"]

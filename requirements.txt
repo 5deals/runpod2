@@ -5,6 +5,10 @@ scipy>=1.14.1
 accelerate>=0.33.0  # Updated for Blackwell compatibility
 triton>=3.3.0  # Required for Blackwell tensor cores
 
+# HuggingFace for Qwen model loading (PoC v2)
+transformers>=4.40.0
+huggingface_hub>=0.20.0
+
 # Runpod SDK
 runpod
 

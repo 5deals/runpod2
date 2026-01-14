@@ -256,3 +256,165 @@ class ValidatedBatch(ProofBatch):
             fraud_detected={self.fraud_detected},
             node_id={self.node_id}
         )""")
+
+
+# ============================================================================
+# PoC v2 - Artifacts (vectors instead of distances)
+# ============================================================================
+
+@dataclass
+class EncodingInfo:
+    """Encoding metadata for artifact vectors."""
+    dtype: str = "f16"  # float16
+    k_dim: int = 12     # first k dimensions of normalized logits
+    endian: str = "le"  # little-endian
+
+    def to_dict(self) -> dict:
+        return {
+            "dtype": self.dtype,
+            "k_dim": self.k_dim,
+            "endian": self.endian,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> 'EncodingInfo':
+        return EncodingInfo(
+            dtype=d.get("dtype", "f16"),
+            k_dim=d.get("k_dim", 12),
+            endian=d.get("endian", "le"),
+        )
+
+
+@dataclass
+class Artifact:
+    """Single artifact with nonce and base64-encoded vector."""
+    nonce: int
+    vector_b64: str  # base64 encoded float16 vector (k_dim dimensions)
+
+    def to_dict(self) -> dict:
+        return {
+            "nonce": self.nonce,
+            "vector_b64": self.vector_b64,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> 'Artifact':
+        return Artifact(
+            nonce=d["nonce"],
+            vector_b64=d["vector_b64"],
+        )
+
+
+@dataclass
+class ArtifactBatch:
+    """Batch of artifacts for PoC v2."""
+    public_key: str
+    block_hash: str
+    block_height: int
+    node_id: int
+    artifacts: List[Artifact]
+    encoding: EncodingInfo = field(default_factory=EncodingInfo)
+
+    def __len__(self) -> int:
+        return len(self.artifacts)
+
+    def to_dict(self) -> dict:
+        return {
+            "public_key": self.public_key,
+            "block_hash": self.block_hash,
+            "block_height": self.block_height,
+            "node_id": self.node_id,
+            "artifacts": [a.to_dict() for a in self.artifacts],
+            "encoding": self.encoding.to_dict(),
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> 'ArtifactBatch':
+        return ArtifactBatch(
+            public_key=d["public_key"],
+            block_hash=d["block_hash"],
+            block_height=d["block_height"],
+            node_id=d["node_id"],
+            artifacts=[Artifact.from_dict(a) for a in d["artifacts"]],
+            encoding=EncodingInfo.from_dict(d.get("encoding", {})),
+        )
+
+    @staticmethod
+    def empty() -> 'ArtifactBatch':
+        return ArtifactBatch(
+            public_key="",
+            block_hash="",
+            block_height=-1,
+            node_id=-1,
+            artifacts=[],
+            encoding=EncodingInfo(),
+        )
+
+    @staticmethod
+    def merge(batches: List['ArtifactBatch']) -> 'ArtifactBatch':
+        """Merge multiple artifact batches into one."""
+        if len(batches) == 0:
+            return ArtifactBatch.empty()
+
+        # Validate all batches have same metadata
+        block_hashes = [b.block_hash for b in batches]
+        assert len(set(block_hashes)) == 1, f"All block hashes must be the same: {block_hashes}"
+
+        block_heights = [b.block_height for b in batches]
+        assert len(set(block_heights)) == 1, f"All block heights must be the same: {block_heights}"
+
+        public_keys = [b.public_key for b in batches]
+        assert len(set(public_keys)) == 1, f"All public keys must be the same: {public_keys}"
+
+        all_artifacts = []
+        for batch in batches:
+            all_artifacts.extend(batch.artifacts)
+
+        return ArtifactBatch(
+            public_key=batches[0].public_key,
+            block_hash=batches[0].block_hash,
+            block_height=batches[0].block_height,
+            node_id=batches[0].node_id,
+            artifacts=all_artifacts,
+            encoding=batches[0].encoding,
+        )
+
+    def split(self, batch_size: int) -> List['ArtifactBatch']:
+        """Split into sub-batches of given size."""
+        sub_batches = []
+        for i in range(0, len(self.artifacts), batch_size):
+            sub_batch = ArtifactBatch(
+                public_key=self.public_key,
+                block_hash=self.block_hash,
+                block_height=self.block_height,
+                node_id=self.node_id,
+                artifacts=self.artifacts[i:i+batch_size],
+                encoding=self.encoding,
+            )
+            sub_batches.append(sub_batch)
+        return sub_batches
+
+    def sort_by_nonce(self) -> 'ArtifactBatch':
+        """Return a new batch with artifacts sorted by nonce."""
+        sorted_artifacts = sorted(self.artifacts, key=lambda a: a.nonce)
+        return ArtifactBatch(
+            public_key=self.public_key,
+            block_hash=self.block_hash,
+            block_height=self.block_height,
+            node_id=self.node_id,
+            artifacts=sorted_artifacts,
+            encoding=self.encoding,
+        )
+
+    def __str__(self) -> str:
+        nonces = [a.nonce for a in self.artifacts[:5]]
+        return dedent(f"""\
+        ArtifactBatch(
+            public_key={self.public_key},
+            block_hash={self.block_hash},
+            block_height={self.block_height},
+            nonces={nonces}...,
+            length={len(self.artifacts)},
+            node_id={self.node_id},
+            encoding={self.encoding}
+        )""")

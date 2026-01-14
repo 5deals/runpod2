@@ -13,8 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from pow.compute.gpu_group import create_gpu_groups, GpuGroup, NotEnoughGPUResources
 from pow.compute.autobs_v2 import get_batch_size_for_gpu_group
-from pow.compute.worker import ParallelWorkerManager, PooledWorkerManager
-from pow.compute.model_init import ModelWrapper
+from pow.compute.worker import ParallelWorkerManager, PooledWorkerManager, PooledWorkerManagerV2
+from pow.compute.model_init import ModelWrapper, QwenModelWrapper
 from pow.compute.orchestrator_client import OrchestratorClient
 from pow.compute.gpu_arch import (
     get_gpu_architecture,
@@ -27,6 +27,9 @@ from pow.models.utils import Params, get_params_with_fp8
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# PoC version: "v1" (custom LLaMA with random weights) or "v2" (Qwen with pretrained weights)
+POC_VERSION = os.getenv("POC_VERSION", "v2")
 
 # Maximum job duration: 7 minutes
 MAX_JOB_DURATION = 7 * 60
@@ -762,11 +765,297 @@ def pooled_handler(event: Dict[str, Any]):
             pass
 
 
+def pooled_handler_v2(event: Dict[str, Any]):
+    """
+    PoC v2 pooled mode handler - uses Qwen model with pretrained weights.
+
+    Key differences from v1:
+    - Uses QwenModelWrapper (pretrained weights from HuggingFace)
+    - Returns artifacts (base64-encoded vectors) instead of distances
+    - No r_target parameter (all artifacts returned)
+    - Model loaded via MODEL_NAME env var (cached by RunPod)
+
+    Input:
+    {
+        "mode": "pooled_v2",
+        "orchestrator_url": "https://orchestrator.example.com"
+    }
+    """
+    global _cuda_broken
+
+    if _cuda_broken:
+        logger.error("CUDA already marked as broken - killing worker immediately")
+        yield {"error": "Worker CUDA is broken", "error_type": "NotEnoughGPUResources", "fatal": True}
+        os._exit(1)
+
+    input_data = event.get("input", {})
+    orchestrator_url = input_data.get("orchestrator_url", "")
+
+    if not orchestrator_url:
+        yield {"error": "orchestrator_url is required for pooled_v2 mode", "error_type": "ValueError"}
+        return
+
+    # Initialize orchestrator client
+    client = OrchestratorClient(orchestrator_url)
+    worker_id = client.worker_id
+
+    logger.info(f"POOLED V2 MODE: worker_id={worker_id}, orchestrator={orchestrator_url}")
+
+    try:
+        import torch
+
+        # Step 1: Detect GPUs
+        gpu_count = torch.cuda.device_count()
+        logger.info(f"Detected {gpu_count} GPUs")
+
+        if gpu_count == 0:
+            yield {"error": "No GPUs detected", "error_type": "NotEnoughGPUResources", "fatal": True}
+            return
+
+        # Step 2: Register with orchestrator
+        yield {"status": "registering", "worker_id": worker_id, "gpu_count": gpu_count, "poc_version": "v2"}
+
+        reg_response = client.register(gpu_count)
+        if reg_response.get("status") == "error":
+            yield {"error": "Failed to register with orchestrator", "error_type": "ConnectionError"}
+            return
+
+        yield {"status": "registered", "worker_id": worker_id}
+
+        # Step 3: Load Qwen model from HuggingFace (pretrained weights)
+        # Unlike v1, we don't need to wait for block_hash - model weights are fixed
+        yield {"status": "loading_model", "poc_version": "v2"}
+
+        logger.info("Loading Qwen model from HuggingFace...")
+        model_start = time.time()
+
+        # Get model config from env or orchestrator
+        from pow.models.qwen_loader import MODEL_NAME, K_DIM
+
+        base_model_data = QwenModelWrapper.build_base_model_qwen(
+            model_name=MODEL_NAME,
+            k_dim=K_DIM,
+        )
+
+        model_load_time = time.time() - model_start
+        logger.info(f"Qwen model loaded in {model_load_time:.1f}s")
+
+        yield {
+            "status": "model_loaded",
+            "load_time": int(model_load_time),
+            "model_name": MODEL_NAME,
+            "k_dim": K_DIM,
+            "hidden_size": base_model_data["hidden_size"],
+            "vocab_size": base_model_data["vocab_size"],
+        }
+
+        # Step 4: Wait for block_hash from orchestrator
+        # (only used for input generation, not model weights)
+        logger.info("Waiting for block_hash from orchestrator...")
+        yield {"status": "waiting_block_hash"}
+
+        wait_start = time.time()
+
+        while not client.current_config.block_hash:
+            if time.time() - wait_start > POOLED_MAX_DURATION:
+                logger.warning("Timeout waiting for block_hash")
+                yield {"status": "timeout", "message": "No block_hash received"}
+                client.notify_shutdown({"reason": "timeout_waiting_block_hash"})
+                return
+
+            config = client.poll_config()
+            if config and config.get("type") == "shutdown":
+                logger.info("Received shutdown before block_hash")
+                yield {"status": "shutdown"}
+                return
+
+            time.sleep(1)
+
+        block_hash = client.current_config.block_hash
+        block_height = client.current_config.block_height
+        seq_len = client.current_config.params.get("seq_len", 16) if client.current_config.params else 16
+
+        logger.info(f"Received block_hash: {block_hash[:16]}...")
+        yield {"status": "received_block_hash", "block_hash": block_hash[:16]}
+
+        # Step 5: Notify orchestrator we're ready
+        ready_response = client.notify_model_loaded()
+
+        if ready_response.get("status") == "error":
+            logger.error("Failed to notify ready")
+            yield {"error": "Failed to notify ready", "error_type": "ConnectionError"}
+            return
+
+        # Get initial job configuration
+        public_key = client.current_config.public_key
+        range_start = client.current_config.nonce_range_start
+        range_end = client.current_config.nonce_range_end
+
+        logger.info(f"Ready to compute: public_key={public_key[:16] if public_key else 'None'}..., range={range_start}-{range_end}")
+        yield {"status": "ready", "public_key": public_key[:16] if public_key else None}
+
+        # Step 6: Create V2 worker manager
+        # For Qwen with device_map="auto", we use a single worker (model spans all GPUs)
+        gpu_group_devices = [[f"cuda:{i}" for i in range(gpu_count)]]
+
+        # Calculate batch size based on available memory
+        # For 32B model on multi-GPU, start with conservative batch size
+        batch_size_per_worker = input_data.get("batch_size", 32)
+
+        manager = PooledWorkerManagerV2(
+            block_hash=block_hash,
+            block_height=block_height,
+            batch_size_per_worker=batch_size_per_worker,
+            gpu_groups=gpu_group_devices,
+            range_start=range_start,
+            range_end=range_end,
+            base_model_data=base_model_data,
+            seq_len=seq_len,
+            max_duration=POOLED_MAX_DURATION,
+        )
+
+        manager.start()
+
+        if not manager.wait_for_ready(timeout=POOLED_MODEL_LOAD_TIMEOUT):
+            logger.error("V2 workers failed to initialize")
+            yield {"error": "Worker initialization timeout", "error_type": "TimeoutError"}
+            manager.stop()
+            return
+
+        # Set initial public_key if we have one
+        if public_key:
+            manager.set_public_key(public_key)
+
+        logger.info("All V2 workers ready, starting compute loop")
+        yield {"status": "computing", "poc_version": "v2"}
+
+        # Step 7: Main compute loop
+        session_start = time.time()
+        total_batches_sent = 0
+        last_poll_time = time.time()
+
+        while True:
+            elapsed = time.time() - session_start
+
+            if elapsed > POOLED_MAX_DURATION:
+                logger.info(f"Session timeout after {elapsed:.0f}s")
+                break
+
+            if not manager.is_alive():
+                logger.info("All workers have stopped")
+                break
+
+            # Poll orchestrator for commands
+            if time.time() - last_poll_time >= POOLED_POLL_INTERVAL:
+                last_poll_time = time.time()
+                command = client.poll_config()
+
+                if command:
+                    cmd_type = command.get("type")
+
+                    if cmd_type == "switch_job":
+                        # Flush pending results before switching
+                        pending_results = manager.get_all_pending_results()
+                        for result in pending_results:
+                            client.send_result(result)
+                            total_batches_sent += 1
+
+                        new_public_key = command.get("public_key")
+                        if new_public_key:
+                            manager.switch_public_key(new_public_key)
+                            logger.info(f"Switched to public_key: {new_public_key[:16]}...")
+                            yield {
+                                "status": "switched_public_key",
+                                "public_key": new_public_key[:16],
+                            }
+
+                    elif cmd_type == "shutdown":
+                        logger.info("Received shutdown command")
+                        break
+
+                    elif cmd_type == "compute" and command.get("public_key"):
+                        new_public_key = command.get("public_key")
+                        manager.set_public_key(new_public_key)
+                        logger.info(f"Set public_key: {new_public_key[:16]}...")
+
+            # Collect and send results (artifacts)
+            results = manager.get_results(timeout=0.1)
+
+            for result in results:
+                if "error" in result:
+                    logger.error(f"Worker {result.get('worker_id')} error: {result['error']}")
+                    yield result
+                    continue
+
+                # Send artifacts to orchestrator
+                client.send_result(result)
+                total_batches_sent += 1
+
+                # Yield for RunPod streaming
+                yield result
+
+            time.sleep(0.01)
+
+        # Step 8: Cleanup
+        logger.info(f"V2 session ended: {total_batches_sent} batches sent")
+
+        pending_results = manager.get_all_pending_results()
+        for result in pending_results:
+            client.send_result(result)
+            total_batches_sent += 1
+
+        manager.stop()
+
+        client.notify_shutdown({
+            "total_batches_sent": total_batches_sent,
+            "session_duration": int(time.time() - session_start),
+            "poc_version": "v2",
+        })
+
+        yield {
+            "status": "shutdown",
+            "total_batches_sent": total_batches_sent,
+            "session_duration": int(time.time() - session_start),
+            "poc_version": "v2",
+        }
+
+        # Free GPU memory
+        del base_model_data
+        torch.cuda.empty_cache()
+
+    except NotEnoughGPUResources as e:
+        _cuda_broken = True
+        logger.error(f"GPU INIT FAILED: {str(e)}")
+        yield {"error": str(e), "error_type": "NotEnoughGPUResources", "fatal": True}
+        client.notify_shutdown({"error": str(e)})
+        os._exit(1)
+
+    except Exception as e:
+        logger.error(f"POOLED V2 ERROR: {str(e)}", exc_info=True)
+        yield {"error": str(e), "error_type": type(e).__name__}
+        try:
+            client.notify_shutdown({"error": str(e)})
+        except:
+            pass
+
+    finally:
+        try:
+            client.close()
+        except:
+            pass
+
+
 def handler(event: Dict[str, Any]):
     """
     Main handler - dispatches to pooled, warmup, or generation mode.
 
-    Pooled mode input (orchestrator-managed):
+    Pooled V2 mode input (PoC v2 with Qwen, recommended):
+    {
+        "mode": "pooled_v2",
+        "orchestrator_url": "https://orchestrator.example.com"
+    }
+
+    Pooled mode input (PoC v1, orchestrator-managed):
     {
         "mode": "pooled",
         "orchestrator_url": "https://orchestrator.example.com"
@@ -788,9 +1077,19 @@ def handler(event: Dict[str, Any]):
     input_data = event.get("input", {})
     mode = input_data.get("mode", "")
 
-    # Check for pooled mode first
+    # Check for pooled v2 mode (PoC v2 with Qwen)
+    if mode == "pooled_v2":
+        yield from pooled_handler_v2(event)
+        return
+
+    # Check for pooled mode (PoC v1)
     if mode == "pooled":
-        yield from pooled_handler(event)
+        # Auto-upgrade to v2 if POC_VERSION is v2
+        if POC_VERSION == "v2":
+            logger.info("Auto-upgrading pooled mode to v2 (POC_VERSION=v2)")
+            yield from pooled_handler_v2(event)
+        else:
+            yield from pooled_handler(event)
         return
 
     # Legacy modes

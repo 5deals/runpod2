@@ -255,3 +255,144 @@ class ModelWrapper(torch.nn.Module):
             logger.info(f"ModelWrapper created in {stats.model_load_time:.2f}s")
 
             return model_wrapper
+
+
+# ============================================================================
+# PoC v2 - Qwen Model Support (pretrained weights from HuggingFace)
+# ============================================================================
+
+class QwenModelWrapper(torch.nn.Module):
+    """Wrapper for Qwen models loaded from HuggingFace."""
+
+    def __init__(
+        self,
+        module: torch.nn.Module,
+        stats: TimeStats = None,
+        k_dim: int = 12,
+    ):
+        super().__init__()
+        self.module = module
+        self.stats = stats
+        self.k_dim = k_dim
+        self.vocab_size = module.config.vocab_size
+        self.hidden_size = module.config.hidden_size
+
+    def forward(self, inputs: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        Forward pass that returns normalized logits for artifacts.
+
+        Args:
+            inputs: Input tensor of shape (batch, seq_len, hidden_size)
+
+        Returns:
+            Normalized logits of shape (batch, k_dim) - first k dimensions
+        """
+        with torch.no_grad():
+            with self.stats.time_infer():
+                # Get device from model
+                device = next(self.module.parameters()).device
+                dtype = next(self.module.parameters()).dtype
+
+                # Move inputs to model device
+                inputs = inputs.to(device=device, dtype=dtype)
+
+                # Qwen expects inputs_embeds for direct embedding input
+                outputs = self.module(inputs_embeds=inputs, return_dict=True)
+
+                # Get logits from last token position
+                logits = outputs.logits[:, -1, :]  # (batch, vocab_size)
+
+                # Normalize logits (L2 norm)
+                logits_norm = torch.nn.functional.normalize(logits, p=2, dim=-1)
+
+                # Return first k_dim dimensions
+                return logits_norm[:, :self.k_dim]
+
+    @staticmethod
+    def build_base_model_qwen(
+        model_name: str = None,
+        dtype: torch.dtype = torch.float16,
+        k_dim: int = 12,
+    ) -> dict:
+        """
+        Load Qwen model from HuggingFace with pretrained weights.
+
+        Unlike v1 (build_base_model), this does NOT use block_hash for weights.
+        Model weights come from HuggingFace pretrained checkpoint.
+
+        Args:
+            model_name: HuggingFace model ID (default from MODEL_NAME env)
+            dtype: Model dtype
+            k_dim: Number of logit dimensions for artifacts
+
+        Returns:
+            Dict with model data for cloning to workers
+        """
+        from pow.models.qwen_loader import load_qwen_model, MODEL_NAME, K_DIM
+
+        if model_name is None:
+            model_name = MODEL_NAME
+        if k_dim is None:
+            k_dim = K_DIM
+
+        start_time = time.time()
+        logger.info(f"Loading Qwen model from HuggingFace: {model_name}")
+
+        # Load model with auto device map (multi-GPU support)
+        model = load_qwen_model(
+            model_name=model_name,
+            dtype=dtype,
+            device_map="auto",
+        )
+
+        load_time = time.time() - start_time
+        logger.info(
+            f"Qwen model loaded in {load_time:.2f}s | "
+            f"hidden_size={model.config.hidden_size}, "
+            f"vocab_size={model.config.vocab_size}"
+        )
+
+        return {
+            "model": model,
+            "model_name": model_name,
+            "dtype": dtype,
+            "k_dim": k_dim,
+            "vocab_size": model.config.vocab_size,
+            "hidden_size": model.config.hidden_size,
+        }
+
+    @staticmethod
+    def build_from_qwen_model(
+        base_model_data: dict,
+        stats: TimeStats,
+        target_device: str = None,  # Ignored for Qwen - uses device_map="auto"
+    ) -> "QwenModelWrapper":
+        """
+        Create QwenModelWrapper from loaded model.
+
+        For Qwen with device_map="auto", the model is already distributed.
+        Workers share the same model instance (no GPU→GPU cloning needed).
+
+        Args:
+            base_model_data: Dict from build_base_model_qwen()
+            stats: TimeStats for inference timing
+            target_device: Ignored (Qwen uses auto device mapping)
+
+        Returns:
+            QwenModelWrapper ready for inference
+        """
+        start_time = time.time()
+
+        model = base_model_data["model"]
+        k_dim = base_model_data["k_dim"]
+
+        logger.info(f"Creating QwenModelWrapper (k_dim={k_dim})...")
+
+        wrapper = QwenModelWrapper(
+            module=model,
+            stats=stats,
+            k_dim=k_dim,
+        )
+
+        logger.info(f"QwenModelWrapper created in {time.time() - start_time:.2f}s")
+        return wrapper
