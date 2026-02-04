@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-RunPod Serverless Handler for PoC v2 using vLLM.
+RunPod Worker Handler for PoC v2 using vLLM.
+
+Supports two modes:
+1. Serverless mode: RunPod jobs with input parameters
+2. Warmup mode: Pre-load model, connect to orchestrator, wait for jobs
 
 This handler communicates with vLLM's PoC endpoints via HTTP.
 vLLM is started by startup.sh before this handler runs.
 """
 
 import os
+import sys
 import time
 import logging
 import requests
@@ -33,7 +38,11 @@ VLLM_BASE_URL = f"http://{VLLM_HOST}:{VLLM_PORT}"
 # Model settings
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8")
 K_DIM = int(os.getenv("K_DIM", "12"))
-SEQ_LEN = int(os.getenv("SEQ_LEN", "256"))
+SEQ_LEN = int(os.getenv("SEQ_LEN", "1024"))
+
+# Warmup mode settings
+WARMUP_MODE = os.getenv("WARMUP_MODE", "false").lower() == "true"
+ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "")
 
 # HTTP timeouts
 REQUEST_TIMEOUT = 300  # 5 minutes for compute
@@ -87,6 +96,7 @@ class VLLMPoCClient:
         Start continuous artifact generation.
 
         Results are sent to callback_url if provided.
+        Uses node_id/node_count for nonce interleaving in PoC v2.
         """
         payload = {
             "block_hash": block_hash,
@@ -103,6 +113,7 @@ class VLLMPoCClient:
                 "k_dim": K_DIM,
             },
         }
+
         if callback_url:
             payload["url"] = callback_url
 
@@ -276,41 +287,184 @@ def single_handler_v2(input_data: Dict) -> Generator[Dict, None, None]:
 
 def pooled_handler_v2(input_data: Dict) -> Generator[Dict, None, None]:
     """
-    Pooled mode for orchestrator - continuous artifact generation with callbacks.
+    Pooled mode for orchestrator - warmup and continuous artifact generation.
 
-    Input:
-        orchestrator_url: str - URL to send results
-        block_hash: str
-        block_height: int
-        public_key: str
-        node_id: int
-        node_count: int
-        batch_size: int (default 32)
+    Workflow:
+    1. Worker starts, vLLM loads model (warmup)
+    2. Connect to orchestrator and register as ready
+    3. Wait for orchestrator to assign block_hash and public_key (up to 10 minutes)
+    4. Start continuous generation with callbacks
+    5. Handle job switching and shutdown commands
+
+    Input (minimal):
+        orchestrator_url: str - Orchestrator base URL (e.g., https://orch.com/e/runpod|main)
+
+    Orchestrator assigns dynamically:
+        - worker_id (auto-generated)
+        - block_hash, block_height (when session starts)
+        - public_key, node_id, node_count (when job assigned)
     """
+    import uuid
+    import subprocess
+
     orchestrator_url = input_data.get("orchestrator_url")
     if not orchestrator_url:
         yield {"error": "orchestrator_url required", "error_type": "ValidationError", "fatal": True}
         return
 
-    block_hash = input_data["block_hash"]
-    block_height = input_data["block_height"]
-    public_key = input_data["public_key"]
-    node_id = input_data.get("node_id", 0)
-    node_count = input_data.get("node_count", 1)
+    # Generate worker ID
+    worker_id = str(uuid.uuid4())
     batch_size = input_data.get("batch_size", 32)
 
-    logger.info(f"POOLED V2 MODE: orchestrator={orchestrator_url}")
-    logger.info(f"  block_hash={block_hash[:16]}..., public_key={public_key[:16]}...")
-    logger.info(f"  node_id={node_id}, node_count={node_count}, batch_size={batch_size}")
+    # Detect GPU count
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        gpu_count = len([line for line in result.stdout.strip().split("\n") if line])
+    except Exception as e:
+        logger.warning(f"Could not detect GPU count: {e}, defaulting to 1")
+        gpu_count = 1
+
+    logger.info("=" * 60)
+    logger.info(f"POOLED V2 MODE (Warmup)")
+    logger.info(f"  Worker ID: {worker_id[:8]}...")
+    logger.info(f"  Orchestrator: {orchestrator_url}")
+    logger.info(f"  GPU Count: {gpu_count}")
+    logger.info("=" * 60)
 
     # Check vLLM health
+    logger.info("Checking vLLM health...")
     if not vllm_client.health_check():
         yield {"error": "vLLM server not healthy", "error_type": "ServerError", "fatal": True}
         return
 
-    yield {"status": "vllm_ready", "poc_version": "v2"}
+    yield {"status": "vllm_ready", "worker_id": worker_id, "poc_version": "v2"}
+
+    # Connect to orchestrator
+    logger.info("Connecting to orchestrator...")
+    try:
+        response = requests.post(
+            f"{orchestrator_url}/api/workers/connect",
+            json={
+                "worker_id": worker_id,
+                "gpu_count": gpu_count,
+                "gpu_info": [],
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        connect_data = response.json()
+        logger.info(f"Connected: {connect_data}")
+
+        yield {
+            "status": "connected",
+            "worker_id": worker_id,
+            "connect_response": connect_data,
+        }
+
+    except Exception as e:
+        logger.error(f"Connection failed: {e}")
+        yield {"error": f"Connection failed: {e}", "error_type": "ConnectionError", "fatal": True}
+        return
+
+    # Poll for config (block_hash) - wait up to 10 minutes
+    logger.info("Waiting for block_hash from orchestrator (max 10 minutes)...")
+    poll_start = time.time()
+    max_wait = 600  # 10 minutes
+    poll_interval = 0.5  # 500ms
+    block_hash = None
+    block_height = None
+    r_target = None
+
+    while time.time() - poll_start < max_wait:
+        try:
+            response = requests.get(
+                f"{orchestrator_url}/api/workers/{worker_id}/config",
+                timeout=10,
+            )
+            if response.status_code == 200:
+                config = response.json()
+                if config and config.get("type") == "config":
+                    block_hash = config.get("block_hash")
+                    block_height = config.get("block_height")
+                    r_target = config.get("r_target")
+                    if block_hash:
+                        logger.info(f"Received block_hash: {block_hash[:16]}...")
+                        break
+
+                elif config and config.get("type") == "shutdown":
+                    logger.info("Received shutdown command while waiting")
+                    yield {"status": "shutdown", "reason": "orchestrator_command"}
+                    return
+
+        except Exception as e:
+            logger.warning(f"Poll config error: {e}")
+
+        time.sleep(poll_interval)
+
+    if not block_hash:
+        elapsed = int(time.time() - poll_start)
+        logger.error(f"Timeout waiting for block_hash ({elapsed}s)")
+        yield {"error": f"Timeout waiting for config ({elapsed}s)", "error_type": "TimeoutError", "fatal": True}
+        return
+
+    yield {
+        "status": "config_received",
+        "block_hash": block_hash[:16] + "...",
+        "block_height": block_height,
+    }
+
+    # Model already loaded (vLLM warmup), notify ready
+    logger.info("Notifying orchestrator: ready for job assignment")
+    try:
+        response = requests.post(
+            f"{orchestrator_url}/api/workers/{worker_id}/ready",
+            json={"gpu_count": gpu_count},
+            timeout=30,
+        )
+        response.raise_for_status()
+        ready_data = response.json()
+        logger.info(f"Ready response: {ready_data}")
+
+        if ready_data.get("status") == "wait":
+            logger.info("Orchestrator says wait for job assignment...")
+            # Could poll again here, but for simplicity assume job comes soon
+            yield {"status": "waiting_for_job"}
+            time.sleep(5)
+            # TODO: implement polling for job assignment
+            yield {"error": "Job assignment not implemented yet", "error_type": "NotImplemented", "fatal": True}
+            return
+
+        public_key = ready_data.get("public_key")
+        node_id = ready_data.get("node_id", 0)
+        node_count = ready_data.get("node_count", 1)
+
+        if not public_key:
+            yield {"error": "No public_key in ready response", "error_type": "ConfigError", "fatal": True}
+            return
+
+    except Exception as e:
+        logger.error(f"Ready notification failed: {e}")
+        yield {"error": f"Ready notification failed: {e}", "error_type": "ReadyError", "fatal": True}
+        return
+
+    logger.info(f"Job assigned: pk={public_key[:16]}..., node_id={node_id}/{node_count}")
+    yield {
+        "status": "job_assigned",
+        "public_key": public_key[:16] + "...",
+        "node_id": node_id,
+        "node_count": node_count,
+    }
+
+    # Build callback URL (orchestrator expects artifacts at /callback/generated)
+    callback_url = f"{orchestrator_url}/callback/generated"
 
     # Start continuous generation
+    logger.info("Starting artifact generation...")
     try:
         result = vllm_client.init_generate(
             block_hash=block_hash,
@@ -319,7 +473,7 @@ def pooled_handler_v2(input_data: Dict) -> Generator[Dict, None, None]:
             node_id=node_id,
             node_count=node_count,
             batch_size=batch_size,
-            callback_url=orchestrator_url,
+            callback_url=callback_url,
         )
 
         yield {
@@ -333,12 +487,25 @@ def pooled_handler_v2(input_data: Dict) -> Generator[Dict, None, None]:
         yield {"error": str(e), "error_type": "InitError", "fatal": True}
         return
 
-    # Monitor generation (vLLM sends results to orchestrator via callbacks)
+    # Monitor generation and handle commands
     start_time = time.time()
     last_status_time = 0
+    last_heartbeat = 0
 
     while True:
         elapsed = time.time() - start_time
+
+        # Send heartbeat every 10 seconds
+        if elapsed - last_heartbeat >= 10:
+            try:
+                requests.post(
+                    f"{orchestrator_url}/api/workers/{worker_id}/heartbeat",
+                    json={"pending_results": 0},
+                    timeout=10,
+                )
+            except Exception:
+                pass
+            last_heartbeat = elapsed
 
         # Send status every 30 seconds
         if elapsed - last_status_time >= 30:
@@ -355,10 +522,42 @@ def pooled_handler_v2(input_data: Dict) -> Generator[Dict, None, None]:
                 logger.info(f"Generation ended: {status.get('status')}")
                 break
 
+        # Poll for commands (switch_job, shutdown)
+        try:
+            response = requests.get(
+                f"{orchestrator_url}/api/workers/{worker_id}/config",
+                timeout=5,
+            )
+            if response.status_code == 200:
+                cmd = response.json()
+                if cmd and cmd.get("type") == "shutdown":
+                    logger.info("Received shutdown command")
+                    vllm_client.stop()
+                    break
+                elif cmd and cmd.get("type") == "switch_job":
+                    new_public_key = cmd.get("public_key")
+                    logger.info(f"Received switch_job: {new_public_key[:16] if new_public_key else 'None'}...")
+                    # TODO: implement job switching
+                    yield {"status": "switch_job_not_implemented"}
+
+        except Exception:
+            pass
+
         time.sleep(5)
 
     # Final status
     final_status = vllm_client.get_status()
+
+    # Notify shutdown
+    try:
+        requests.post(
+            f"{orchestrator_url}/api/workers/{worker_id}/shutdown",
+            json={"stats": {}},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
     yield {
         "status": "completed",
         "elapsed_seconds": int(time.time() - start_time),
